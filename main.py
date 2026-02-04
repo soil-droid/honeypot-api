@@ -1,6 +1,7 @@
-from fastapi import FastAPI, HTTPException, Header
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, Request
+from pydantic import BaseModel
 from typing import Dict, List, Optional
+import os
 import uuid
 
 # Import our agent logic
@@ -8,63 +9,65 @@ from agent import generate_honeypot_response, extract_intelligence
 
 app = FastAPI(title="Agentic Honey-Pot API")
 
-# --- IN-MEMORY DATABASE (For the Hackathon) ---
-# In production, use Redis. For a hackathon, a Dict is fine.
-# Structure: { "session_id": [ {role: "user", content: "..."} ] }
+# --- IN-MEMORY DATABASE ---
 sessions: Dict[str, List[Dict]] = {}
 
-# --- INPUT MODELS ---
-# Adjust these field names based on the OFFICIAL Hackathon Docs
-class ScamMessage(BaseModel):
-    session_id: str = Field(..., description="Unique ID for this conversation")
-    message: str = Field(..., description="The message from the scammer")
-    metadata: Optional[dict] = None
-
-class IntelligenceResponse(BaseModel):
-    scam_detected: bool
-    reply: str
-    extracted_intelligence: dict
-    conversation_turn: int
-
-# --- THE ENDPOINT ---
-@app.post("/detect-and-respond", response_model=IntelligenceResponse)
-async def chat_endpoint(payload: ScamMessage, x_api_key: str = Header(None)):
+# --- FLEXIBLE ENDPOINT ---
+@app.post("/detect-and-respond")
+async def chat_endpoint(request: Request):
     """
-    Receives a scam message, processes it via the Honey-Pot Agent, and returns a reply.
+    Accepts ANY JSON payload to debug field names.
     """
-    # 1. Authenticate (Optional security for the hackathon)
-    # if x_api_key != "YOUR_SECRET_KEY":
-    #     raise HTTPException(status_code=401, detail="Invalid API Key")
+    try:
+        # 1. Get the raw JSON
+        payload = await request.json()
+        print(f"--- DEBUG: INCOMING PAYLOAD ---\n{payload}\n-------------------------------")
 
-    session_id = payload.session_id
-    incoming_msg = payload.message
+        # 2. Dynamically find the message and session_id
+        # We check multiple common variations of field names
+        incoming_msg = (
+            payload.get("message") or 
+            payload.get("text") or 
+            payload.get("content") or 
+            payload.get("input") or 
+            ""
+        )
+        
+        session_id = (
+            payload.get("session_id") or 
+            payload.get("id") or 
+            payload.get("conversation_id") or 
+            "default_session"
+        )
 
-    # 2. Initialize session if new
-    if session_id not in sessions:
-        sessions[session_id] = []
-    
-    # 3. Add User message to memory
-    sessions[session_id].append({"role": "user", "content": incoming_msg})
+        # 3. If empty, return a safe error (so the platform doesn't crash)
+        if not incoming_msg:
+            return {
+                "error": "No message field found",
+                "received_keys": list(payload.keys())
+            }
 
-    # 4. Generate AI Response (The "Vikram" Persona)
-    ai_reply = generate_honeypot_response(sessions[session_id])
-    
-    # 5. Add AI message to memory
-    sessions[session_id].append({"role": "assistant", "content": ai_reply})
+        # 4. Standard Logic
+        if session_id not in sessions:
+            sessions[session_id] = []
+        
+        sessions[session_id].append({"role": "user", "content": incoming_msg})
+        ai_reply = generate_honeypot_response(sessions[session_id])
+        sessions[session_id].append({"role": "assistant", "content": ai_reply})
+        intel = extract_intelligence(incoming_msg)
 
-    # 6. Extract Intelligence (Did they reveal a bank account?)
-    # We scan the *incoming* message for scammer details
-    intel = extract_intelligence(incoming_msg)
+        # 5. Return the Standard Response
+        return {
+            "scam_detected": True,
+            "reply": ai_reply,
+            "extracted_intelligence": intel,
+            "conversation_turn": len(sessions[session_id])
+        }
 
-    # 7. Return the structured JSON
-    return {
-        "scam_detected": True, # In a real app, you'd use a classifier here. For Honey-Pot, assume True.
-        "reply": ai_reply,
-        "extracted_intelligence": intel,
-        "conversation_turn": len(sessions[session_id])
-    }
+    except Exception as e:
+        print(f"ERROR PROCESSING REQUEST: {e}")
+        return {"error": str(e)}
 
-# --- HEALTH CHECK ---
 @app.get("/")
 def home():
-    return {"status": "Agent Vikram is Online and Ready to Waste Time."}
+    return {"status": "Online"}
